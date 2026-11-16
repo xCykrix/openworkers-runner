@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "openworkers-runner"
-version = "1.18.8"
+version = "1.18.9"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
