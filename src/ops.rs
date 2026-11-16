@@ -1020,10 +1020,12 @@ impl OperationsHandler for RunnerOperations {
                 req = req.header(name, value);
             }
 
-            let response = req
-                .send()
-                .await
-                .map_err(|e| format!("WebSocket connect error: {}", e))?;
+            let response = req.send().await.map_err(|e| {
+                format!(
+                    "WebSocket connect error: {}",
+                    crate::services::net_guard::error_chain(&e)
+                )
+            })?;
 
             if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
                 return Err(format!(

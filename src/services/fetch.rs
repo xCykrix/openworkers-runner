@@ -331,10 +331,12 @@ pub async fn do_fetch(
     }
 
     // Execute request
-    let response = req_builder
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+    let response = req_builder.send().await.map_err(|e| {
+        format!(
+            "Request failed: {}",
+            crate::services::net_guard::error_chain(&e)
+        )
+    })?;
 
     let status = response.status().as_u16();
     tracing::debug!("[fetch] headers status={} thread={}", status, thread_name());

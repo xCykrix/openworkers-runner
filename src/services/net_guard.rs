@@ -189,6 +189,10 @@ impl Resolve for FilteringResolver {
 
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host(lookup).await?.collect();
 
+            if *ALLOW_PRIVATE_NETWORK {
+                return Ok(Box::new(addrs.into_iter()) as Addrs);
+            }
+
             for addr in &addrs {
                 if !ip_is_public(addr.ip()) {
                     let msg = blocked_msg(&addr.ip().to_string());
@@ -200,6 +204,23 @@ impl Resolve for FilteringResolver {
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
+}
+
+/// Format an error with its whole `source()` chain.
+///
+/// `reqwest::Error` displays only "error sending request for url (...)"; the
+/// cause, such as a `FilteringResolver` rejection, sits in the chain.
+pub fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -277,6 +298,31 @@ mod tests {
         assert!(guard_url_host("http://2130706433/").is_err()); // decimal
         assert!(guard_url_host("http://0x7f.0.0.1/").is_err()); // hex octet
         assert!(guard_url_host("http://127.1/").is_err()); // short form
+    }
+
+    #[test]
+    fn error_chain_includes_sources() {
+        let err = ChainedError(std::io::Error::other(blocked_msg("100.64.0.2")));
+
+        assert_eq!(
+            error_chain(&err),
+            "outer: fetch to non-public address is not allowed: 100.64.0.2"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ChainedError(std::io::Error);
+
+    impl std::fmt::Display for ChainedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer")
+        }
+    }
+
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
     }
 
     #[test]
