@@ -50,7 +50,7 @@ fn room(namespace: NamespaceConfig, id: String) -> Reload {
                 version: 1,
                 limits: openworkers_runner::task_executor::TaskExecutionConfig::default_limits(),
                 idle: Duration::from_secs(60),
-                drain: openworkers_runner::durable::DRAIN,
+                drain: openworkers_runner::durable::drain(),
             })
         })
     })

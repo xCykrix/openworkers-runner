@@ -69,7 +69,7 @@ impl Drop for DepthGuard {
 
 #[cfg(feature = "v8")]
 pub use registry::{
-    AlarmError, DRAIN, IDLE, MAX_RESIDENT_PER_ACCOUNT, ObjectSource, alarm, load, retire,
+    AlarmError, ObjectSource, alarm, drain, idle, load, max_resident, object_limits, retire,
     running_versions, send, socket_event, stop_namespace,
 };
 
@@ -158,15 +158,96 @@ mod registry {
     use super::CallDepths;
     use crate::worker_pool::WORKER_POOL;
 
+    /// The bounds a Durable Object runs under, read once from the
+    /// environment. `DO_IDLE_MS`, `DO_DRAIN_MS`, `DO_MAX_RESIDENT`,
+    /// `DO_CPU_TIME_LIMIT_MS`, `DO_WALL_CLOCK_TIMEOUT_MS`, `DO_HEAP_INITIAL_MB`,
+    /// `DO_HEAP_MAX_MB` and `DO_STREAM_BUFFER_SIZE` override the defaults.
+    pub struct Limits {
+        /// An object with no event in flight for this long gives its isolate back.
+        pub idle: Duration,
+        /// An object that stops has this long to end the events it took.
+        pub drain: Duration,
+        /// The objects an account keeps resident; 0 removes the bound. Each
+        /// object has an isolate of its own, so an account that starts
+        /// objects without end would take the memory of the runner.
+        pub max_resident: usize,
+        /// The limits an object's isolate runs under.
+        pub runtime: RuntimeLimits,
+    }
+
+    impl Limits {
+        fn get() -> &'static Self {
+            static LIMITS: std::sync::LazyLock<Limits> =
+                std::sync::LazyLock::new(|| Limits::from_vars(|name| std::env::var(name).ok()));
+
+            &LIMITS
+        }
+
+        /// Reads the bounds from `var`, which gives the value of a variable.
+        pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+            let num64 = |name: &str, default: u64| {
+                var(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+            };
+            let num = |name: &str, default: usize| {
+                var(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+            };
+
+            // A max of 0 starves every isolate and initial > max trips a V8
+            // check; an absurd max wraps the `* 1MB` downstream. Keep both in
+            // [1MB, 1TB] with initial <= max.
+            let heap_max_mb = num("DO_HEAP_MAX_MB", 128).clamp(1, 1 << 20);
+
+            Self {
+                idle: Duration::from_millis(num64("DO_IDLE_MS", 60_000)),
+                drain: Duration::from_millis(num64("DO_DRAIN_MS", 30_000)),
+                max_resident: match num("DO_MAX_RESIDENT", 100) {
+                    0 => usize::MAX,
+                    n => n,
+                },
+                runtime: RuntimeLimits {
+                    max_cpu_time_ms: num64(
+                        "DO_CPU_TIME_LIMIT_MS",
+                        crate::task_executor::DEFAULT_CPU_TIME_MS,
+                    ),
+                    max_wall_clock_time_ms: num64(
+                        "DO_WALL_CLOCK_TIMEOUT_MS",
+                        crate::task_executor::DEFAULT_WALL_CLOCK_TIME_MS,
+                    ),
+                    heap_initial_mb: num("DO_HEAP_INITIAL_MB", 1).clamp(1, heap_max_mb),
+                    heap_max_mb,
+                    // Feeds a tokio mpsc channel, which panics on a 0 buffer.
+                    stream_buffer_size: num("DO_STREAM_BUFFER_SIZE", 16).max(1),
+                    ..Default::default()
+                },
+            }
+        }
+    }
+
     /// An object with no event in flight for this long gives its isolate back.
-    pub const IDLE: Duration = Duration::from_secs(60);
+    /// `DO_IDLE_MS` overrides the 60s default.
+    pub fn idle() -> Duration {
+        Limits::get().idle
+    }
 
     /// An object that stops has this long to end the events it took.
-    pub const DRAIN: Duration = Duration::from_secs(30);
+    /// `DO_DRAIN_MS` overrides the 30s default.
+    pub fn drain() -> Duration {
+        Limits::get().drain
+    }
 
-    /// Each object has an isolate of its own, so an account that starts
-    /// objects without end would take the memory of the runner.
-    pub const MAX_RESIDENT_PER_ACCOUNT: usize = 100;
+    /// The objects an account may keep resident; `DO_MAX_RESIDENT` overrides
+    /// the 100-object default and 0 removes the bound.
+    pub fn max_resident() -> usize {
+        Limits::get().max_resident
+    }
+
+    /// The limits an object's isolate runs under. `DO_CPU_TIME_LIMIT_MS`,
+    /// `DO_WALL_CLOCK_TIMEOUT_MS`, `DO_HEAP_INITIAL_MB`, `DO_HEAP_MAX_MB` and
+    /// `DO_STREAM_BUFFER_SIZE` override the defaults (0 disables the cpu/wall
+    /// guard).
+    pub fn object_limits() -> RuntimeLimits {
+        Limits::get().runtime.clone()
+    }
 
     /// What an object is built from: the worker that exports its class.
     pub struct ObjectSource {
@@ -283,7 +364,7 @@ mod registry {
     }
 
     /// Stops the objects that run `version` of `worker_id`: they take no new
-    /// request, and end once their events do, or after DRAIN. The next
+    /// request, and end once their events do, or after drain(). The next
     /// request starts the object again, after the old one ends.
     /// Their WebSockets close, as on Cloudflare.
     pub fn retire(worker_id: &str, version: i32) {
@@ -439,7 +520,7 @@ mod registry {
 
         let account = namespace.user_id.clone();
 
-        if registry.accounts.get(&account).copied().unwrap_or(0) >= MAX_RESIDENT_PER_ACCOUNT {
+        if registry.accounts.get(&account).copied().unwrap_or(0) >= max_resident() {
             return Err("too many Durable Objects run for this account".to_string());
         }
 
@@ -684,9 +765,9 @@ mod registry {
             script,
             version: data.version,
             ops: std::sync::Arc::new(ops),
-            limits: crate::task_executor::TaskExecutionConfig::default_limits(),
-            idle: IDLE,
-            drain: DRAIN,
+            limits: object_limits(),
+            idle: idle(),
+            drain: drain(),
         })
     }
 

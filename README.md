@@ -212,14 +212,23 @@ compiled once instead of on every cold start.
 
 #### V8 Runtime
 
-| Variable                 | Default   | Description                                       |
-| ------------------------ | --------- | ------------------------------------------------- |
-| `V8_EXECUTE`             | `PINNED`  | Execution mode: `PINNED` or `ONESHOT`             |
-| `WORKER_POOL_SIZE`       | CPU cores | Number of V8 worker threads                       |
-| `MAX_QUEUED_WORKERS`     | pool × 10 | Max queued tasks before backpressure              |
-| `WORKER_WAIT_TIMEOUT_MS` | `10000`   | Timeout (ms) waiting for a worker slot            |
-| `ISOLATE_MAX_CONCURRENT` | `1`       | Requests one isolate serves at once (images: 20)  |
-| `CONTEXT_MAX_REUSES`     | `1000`    | Requests a warm context serves before it ages out |
+| Variable                      | Default   | Description                                                              |
+| ----------------------------- | --------- | ------------------------------------------------------------------------ |
+| `V8_EXECUTE`                  | `PINNED`  | Execution mode: `PINNED` or `ONESHOT`                                    |
+| `WORKER_POOL_SIZE`            | CPU cores | Number of V8 worker threads                                              |
+| `MAX_QUEUED_WORKERS`          | pool × 10 | Max queued tasks before backpressure                                     |
+| `WORKER_WAIT_TIMEOUT_MS`      | `10000`   | Timeout (ms) waiting for a worker slot                                   |
+| `ISOLATE_POOL_SIZE`           | `1000`    | Isolates a pool thread holds                                             |
+| `ISOLATE_MAX_PER_OWNER`       | unset     | Isolates one tenant holds per thread; unset or `0` bounds only by the pool |
+| `ISOLATE_MAX_CONCURRENT`      | `1`       | Requests one isolate serves at once (images: 20)                         |
+| `ISOLATE_MAX_CACHED_CONTEXTS` | `10`      | Warm contexts an isolate caches                                          |
+| `ISOLATE_OVERCOMMIT`          | `true`    | Build past the pool ceiling when every isolate is in use                 |
+| `CONTEXT_MAX_REUSES`          | `1000`    | Requests a warm context serves before it ages out                        |
+| `ISOLATE_HEAP_INITIAL_MB`     | `10`      | Isolate initial heap; clamped to `[1, ISOLATE_HEAP_MAX_MB]`              |
+| `ISOLATE_HEAP_MAX_MB`         | `50`      | Isolate heap cap; clamped to `[1, 1048576]`                              |
+| `CPU_TIME_LIMIT_MS`           | `100`     | CPU budget per event-loop turn; `0` disables the guard                   |
+| `WALL_CLOCK_TIMEOUT_MS`       | `64000`   | Wall-clock budget per turn and per-request deadline                      |
+| `ISOLATE_STREAM_BUFFER_SIZE`  | `16`      | Response body channel capacity, in chunks; minimum `1`                   |
 
 `V8_EXECUTE` modes:
 
@@ -251,6 +260,28 @@ closes at once.
 A message or frame over 1 MiB closes the socket with 1009. A drain closes
 every open socket with 1001. A peer that leaves more than 8 MiB unread
 loses the connection, and the worker gets a close with 1008.
+
+#### Durable Objects
+
+Each Durable Object runs an isolate of its own, with limits of its own — the
+`ISOLATE_*` pool settings do not apply to it. The `DO_*` names mirror the
+pool's where the two sides share a knob.
+
+| Variable                   | Default | Description                                                        |
+| -------------------------- | ------- | ------------------------------------------------------------------ |
+| `DO_CPU_TIME_LIMIT_MS`     | `100`   | CPU budget per event-loop turn; `0` disables the guard             |
+| `DO_WALL_CLOCK_TIMEOUT_MS` | `60000` | Wall-clock budget per event-loop turn; `0` disables the guard      |
+| `DO_HEAP_INITIAL_MB`       | `1`     | Isolate initial heap; clamped to `[1, DO_HEAP_MAX_MB]`             |
+| `DO_HEAP_MAX_MB`           | `128`   | Isolate heap cap; clamped to `[1, 1048576]`                        |
+| `DO_STREAM_BUFFER_SIZE`    | `16`    | Response body channel capacity, in chunks; minimum `1`             |
+| `DO_MAX_RESIDENT`          | `100`   | Resident objects per account; `0` removes the bound                |
+| `DO_IDLE_MS`               | `60000` | An object with no event in flight this long gives its isolate back |
+| `DO_DRAIN_MS`              | `30000` | A stopped object has this long to end the events it took           |
+
+The CPU and wall-clock budgets refill on each event-loop turn: a handler that
+awaits I/O gets a fresh budget, so only a single synchronous stretch over the
+limit trips the guard. The number to tune is the longest synchronous burst of
+a handler, not its duration.
 
 #### D1 (SQLite)
 

@@ -1112,6 +1112,74 @@ async fn serve_tls<S>(
     }
 }
 
+/// Reads `name` as a `T` through `var`, which gives the value of a
+/// variable, or `default` when the variable is unset or does not parse.
+#[cfg(feature = "v8")]
+fn env_num<T: std::str::FromStr>(
+    var: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    default: T,
+) -> T {
+    var(name)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The pinned isolate pool's settings, read once from the environment at
+/// start. `wall_clock_timeout_ms` is read earlier — it doubles as the
+/// per-request deadline of the listeners — and comes in as a parameter.
+#[cfg(feature = "v8")]
+#[derive(Debug)]
+struct PoolSettings {
+    max_per_thread: usize,
+    max_per_owner: Option<usize>,
+    max_concurrent_per_isolate: usize,
+    max_cached_contexts: usize,
+    overcommit: bool,
+    max_context_reuses: u32,
+    limits: openworkers_core::RuntimeLimits,
+}
+
+#[cfg(feature = "v8")]
+impl PoolSettings {
+    /// Reads the settings from `var`, which gives the value of a variable.
+    fn from_vars(var: impl Fn(&str) -> Option<String>, wall_clock_timeout_ms: u64) -> Self {
+        let var = &var;
+
+        // A max of 0 starves every isolate and initial > max trips a V8
+        // check; an absurd max wraps the `* 1MB` downstream. Keep both in
+        // [1MB, 1TB] with initial <= max — the Durable Object limits clamp
+        // the same way.
+        let heap_max_mb = env_num(var, "ISOLATE_HEAP_MAX_MB", 50usize).clamp(1, 1 << 20);
+
+        Self {
+            max_per_thread: env_num(var, "ISOLATE_POOL_SIZE", 1000),
+            // The isolates one tenant may hold per thread; unset or 0 bounds
+            // only by the pool's own ceiling.
+            max_per_owner: var("ISOLATE_MAX_PER_OWNER")
+                .and_then(|value| value.parse().ok())
+                .filter(|n| *n > 0),
+            // Requests one isolate serves at once; above 1 they share it
+            // through the runtime's fair queue.
+            max_concurrent_per_isolate: env_num(var, "ISOLATE_MAX_CONCURRENT", 1),
+            max_cached_contexts: env_num(var, "ISOLATE_MAX_CACHED_CONTEXTS", 10),
+            // Only an explicit false or 0 disables, as DB_TEST_BEFORE_ACQUIRE.
+            overcommit: !matches!(var("ISOLATE_OVERCOMMIT").as_deref(), Some("false" | "0")),
+            max_context_reuses: env_num(var, "CONTEXT_MAX_REUSES", 1000u32),
+            limits: openworkers_core::RuntimeLimits {
+                heap_initial_mb: env_num(var, "ISOLATE_HEAP_INITIAL_MB", 10usize)
+                    .clamp(1, heap_max_mb),
+                heap_max_mb,
+                max_cpu_time_ms: env_num(var, "CPU_TIME_LIMIT_MS", 100u64),
+                max_wall_clock_time_ms: wall_clock_timeout_ms,
+                // Feeds a tokio mpsc channel, which panics on a 0 buffer.
+                stream_buffer_size: env_num(var, "ISOLATE_STREAM_BUFFER_SIZE", 16usize).max(1),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
@@ -1301,69 +1369,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize isolate pool for V8 runtime
     #[cfg(feature = "v8")]
     {
-        use openworkers_core::RuntimeLimits;
+        let pool = PoolSettings::from_vars(|name| std::env::var(name).ok(), wall_clock_timeout_ms);
 
-        let pool_max_size = std::env::var("ISOLATE_POOL_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1000); // Default: 1000 isolates
-
-        let heap_initial_mb = std::env::var("ISOLATE_HEAP_INITIAL_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(10); // Default: 10MB
-
-        let heap_max_mb = std::env::var("ISOLATE_HEAP_MAX_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(50); // Default: 50MB
-
-        let cpu_time_limit_ms = std::env::var("CPU_TIME_LIMIT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(100); // Default: 100ms
-
-        // Requests one isolate serves at once; above 1 they share it through
-        // the runtime's fair queue.
-        let max_concurrent_per_isolate = std::env::var("ISOLATE_MAX_CONCURRENT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1);
-
-        let max_context_reuses = std::env::var("CONTEXT_MAX_REUSES")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1000);
-
-        let pool_limits = RuntimeLimits {
-            heap_initial_mb,
-            heap_max_mb,
-            max_cpu_time_ms: cpu_time_limit_ms,
-            max_wall_clock_time_ms: wall_clock_timeout_ms,
-            ..Default::default()
-        };
-
-        debug!(
-            "Isolate pool config: max_size={}, heap_initial={}MB, heap_max={}MB, wall_clock_timeout={}ms, cpu_time_limit={}ms",
-            pool_max_size, heap_initial_mb, heap_max_mb, wall_clock_timeout_ms, cpu_time_limit_ms
-        );
+        debug!("Isolate pool config: {pool:?}");
 
         match openworkers_runner::V8ExecuteMode::get() {
             openworkers_runner::V8ExecuteMode::Pinned => {
                 openworkers_runtime_v8::init_pinned_pool(
                     openworkers_runtime_v8::PinnedPoolConfig {
-                        max_per_thread: pool_max_size,
-                        max_per_owner: None,
-                        max_concurrent_per_isolate,
-                        max_cached_contexts: 10,
-                        overcommit: true,
-                        max_context_reuses,
-                        limits: pool_limits,
+                        max_per_thread: pool.max_per_thread,
+                        max_per_owner: pool.max_per_owner,
+                        max_concurrent_per_isolate: pool.max_concurrent_per_isolate,
+                        max_cached_contexts: pool.max_cached_contexts,
+                        overcommit: pool.overcommit,
+                        max_context_reuses: pool.max_context_reuses,
+                        limits: pool.limits,
                     },
                 );
                 debug!(
                     "Initialized pinned isolate pool with {} isolates max per thread",
-                    pool_max_size
+                    pool.max_per_thread
                 );
             }
             openworkers_runner::V8ExecuteMode::Oneshot => {
@@ -1542,5 +1567,73 @@ mod tests {
             peer("127.0.0.1:50000"),
             &headers
         ));
+    }
+
+    #[cfg(feature = "v8")]
+    mod pool {
+        use crate::PoolSettings;
+        use std::collections::HashMap;
+
+        fn pool(vars: &[(&str, &str)]) -> PoolSettings {
+            let vars: HashMap<String, String> = vars
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+
+            PoolSettings::from_vars(|name| vars.get(name).cloned(), 64_000)
+        }
+
+        #[test]
+        fn the_pool_settings_default_to_the_previous_values() {
+            let pool = pool(&[]);
+
+            assert_eq!(pool.max_per_thread, 1000);
+            assert_eq!(pool.max_per_owner, None);
+            assert_eq!(pool.max_concurrent_per_isolate, 1);
+            assert_eq!(pool.max_cached_contexts, 10);
+            assert!(pool.overcommit);
+            assert_eq!(pool.max_context_reuses, 1000);
+            assert_eq!(pool.limits.heap_initial_mb, 10);
+            assert_eq!(pool.limits.heap_max_mb, 50);
+            assert_eq!(pool.limits.max_cpu_time_ms, 100);
+            assert_eq!(pool.limits.max_wall_clock_time_ms, 64_000);
+            assert_eq!(pool.limits.stream_buffer_size, 16);
+        }
+
+        #[test]
+        fn the_pool_settings_read_the_environment() {
+            let pool = pool(&[
+                ("ISOLATE_POOL_SIZE", "64"),
+                ("ISOLATE_MAX_PER_OWNER", "8"),
+                ("ISOLATE_MAX_CONCURRENT", "20"),
+                ("ISOLATE_MAX_CACHED_CONTEXTS", "32"),
+                ("ISOLATE_OVERCOMMIT", "false"),
+                ("CONTEXT_MAX_REUSES", "250"),
+                ("ISOLATE_HEAP_INITIAL_MB", "24"),
+                ("ISOLATE_HEAP_MAX_MB", "512"),
+                ("CPU_TIME_LIMIT_MS", "500"),
+                ("ISOLATE_STREAM_BUFFER_SIZE", "64"),
+            ]);
+
+            assert_eq!(pool.max_per_thread, 64);
+            assert_eq!(pool.max_per_owner, Some(8));
+            assert_eq!(pool.max_concurrent_per_isolate, 20);
+            assert_eq!(pool.max_cached_contexts, 32);
+            assert!(!pool.overcommit);
+            assert_eq!(pool.max_context_reuses, 250);
+            assert_eq!(pool.limits.heap_initial_mb, 24);
+            assert_eq!(pool.limits.heap_max_mb, 512);
+            assert_eq!(pool.limits.max_cpu_time_ms, 500);
+            assert_eq!(pool.limits.stream_buffer_size, 64);
+        }
+
+        #[test]
+        fn a_zero_or_unparsable_owner_cap_means_no_bound() {
+            let zero = pool(&[("ISOLATE_MAX_PER_OWNER", "0")]);
+            assert_eq!(zero.max_per_owner, None);
+
+            let junk = pool(&[("ISOLATE_MAX_PER_OWNER", "many")]);
+            assert_eq!(junk.max_per_owner, None);
+        }
     }
 }

@@ -359,7 +359,7 @@ async fn an_alarm_the_account_limit_refuses_is_not_a_failed_run() {
         class_name: "Counter".to_string(),
         key: IdKey([5; 32]),
     };
-    let started = futures::future::join_all((0..durable::MAX_RESIDENT_PER_ACCOUNT).map(|n| {
+    let started = futures::future::join_all((0..durable::max_resident()).map(|n| {
         let load = |_| async {
             let code = openworkers_transform::parse_worker_code(
                 b"export class Counter { fetch() { return new Response('up'); } }",
@@ -373,7 +373,7 @@ async fn an_alarm_the_account_limit_refuses_is_not_a_failed_run() {
                 version: 1,
                 limits: openworkers_runner::task_executor::TaskExecutionConfig::default_limits(),
                 idle: std::time::Duration::from_secs(60),
-                drain: durable::DRAIN,
+                drain: durable::drain(),
             })
         };
         let request = openworkers_core::HttpRequest {
