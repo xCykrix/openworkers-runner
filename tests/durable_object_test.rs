@@ -70,7 +70,7 @@ async fn visit(namespace: &NamespaceConfig, name: &str) -> String {
             version: 1,
             limits: openworkers_runner::task_executor::TaskExecutionConfig::default_limits(),
             idle: Duration::from_millis(100),
-            drain: openworkers_runner::durable::DRAIN,
+            drain: openworkers_runner::durable::drain(),
         })
     };
 

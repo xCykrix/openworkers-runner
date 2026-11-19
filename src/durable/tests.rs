@@ -65,7 +65,7 @@ fn source_of(
         ops: Arc::new(ops.with_bindings(bindings)),
         limits: crate::task_executor::TaskExecutionConfig::default_limits(),
         idle,
-        drain: super::DRAIN,
+        drain: super::drain(),
     }
 }
 
@@ -378,7 +378,7 @@ async fn an_account_runs_a_bounded_count_of_objects() {
     let loads = Arc::new(AtomicUsize::new(0));
     let idle = Duration::from_secs(60);
 
-    let answers = futures::future::join_all((0..super::MAX_RESIDENT_PER_ACCOUNT).map(|n| {
+    let answers = futures::future::join_all((0..super::max_resident()).map(|n| {
         let namespace = &resident;
         let loads = &loads;
 
@@ -1015,4 +1015,72 @@ async fn a_client_that_its_object_keeps_up_with_stays_open() {
             format!("{} {}", round * 4, (round * 4) << 20)
         );
     }
+}
+
+fn limits(vars: &[(&str, &str)]) -> super::registry::Limits {
+    let vars: HashMap<String, String> = vars
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+
+    super::registry::Limits::from_vars(|name| vars.get(name).cloned())
+}
+
+#[test]
+fn the_object_limits_default_to_the_pooled_worker_values() {
+    let limits = limits(&[]);
+    let defaults = crate::task_executor::TaskExecutionConfig::default_limits();
+
+    assert_eq!(limits.idle, Duration::from_secs(60));
+    assert_eq!(limits.drain, Duration::from_secs(30));
+    assert_eq!(limits.max_resident, 100);
+    assert_eq!(format!("{:?}", limits.runtime), format!("{defaults:?}"));
+}
+
+#[test]
+fn the_object_limits_read_the_environment() {
+    let limits = limits(&[
+        ("DO_IDLE_MS", "5000"),
+        ("DO_DRAIN_MS", "1000"),
+        ("DO_MAX_RESIDENT", "7"),
+        ("DO_CPU_TIME_LIMIT_MS", "250"),
+        ("DO_WALL_CLOCK_TIMEOUT_MS", "90000"),
+        ("DO_HEAP_INITIAL_MB", "8"),
+        ("DO_HEAP_MAX_MB", "512"),
+        ("DO_STREAM_BUFFER_SIZE", "4"),
+    ]);
+
+    assert_eq!(limits.idle, Duration::from_secs(5));
+    assert_eq!(limits.drain, Duration::from_secs(1));
+    assert_eq!(limits.max_resident, 7);
+    assert_eq!(limits.runtime.max_cpu_time_ms, 250);
+    assert_eq!(limits.runtime.max_wall_clock_time_ms, 90_000);
+    assert_eq!(limits.runtime.heap_initial_mb, 8);
+    assert_eq!(limits.runtime.heap_max_mb, 512);
+    assert_eq!(limits.runtime.stream_buffer_size, 4);
+}
+
+#[test]
+fn a_zero_resident_limit_removes_the_bound() {
+    assert_eq!(limits(&[("DO_MAX_RESIDENT", "0")]).max_resident, usize::MAX);
+}
+
+#[test]
+fn the_object_limits_clamp_the_unsafe_values() {
+    let floors = limits(&[("DO_HEAP_MAX_MB", "0"), ("DO_STREAM_BUFFER_SIZE", "0")]);
+
+    assert_eq!(floors.runtime.heap_max_mb, 1);
+    assert_eq!(floors.runtime.stream_buffer_size, 1);
+
+    let capped = limits(&[("DO_HEAP_INITIAL_MB", "64"), ("DO_HEAP_MAX_MB", "32")]);
+
+    assert_eq!(capped.runtime.heap_initial_mb, 32);
+}
+
+#[test]
+fn an_unparsable_limit_falls_back_to_the_default() {
+    let limits = limits(&[("DO_IDLE_MS", "soon"), ("DO_MAX_RESIDENT", "many")]);
+
+    assert_eq!(limits.idle, Duration::from_secs(60));
+    assert_eq!(limits.max_resident, 100);
 }
